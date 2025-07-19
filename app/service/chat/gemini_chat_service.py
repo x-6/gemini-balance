@@ -13,7 +13,7 @@ from app.handler.stream_optimizer import gemini_optimizer
 from app.log.logger import get_gemini_logger
 from app.service.client.api_client import GeminiApiClient
 from app.service.key.key_manager import KeyManager
-from app.database.services import add_error_log, add_request_log
+from app.database.services import add_error_log, add_request_log, get_file_api_key
 
 logger = get_gemini_logger()
 
@@ -26,6 +26,55 @@ def _has_image_parts(contents: List[Dict[str, Any]]) -> bool:
                 if "image_url" in part or "inline_data" in part:
                     return True
     return False
+
+def _extract_file_references(contents: List[Dict[str, Any]]) -> List[str]:
+    """從內容中提取文件引用"""
+    file_names = []
+    for content in contents:
+        if "parts" in content:
+            for part in content["parts"]:
+                if not isinstance(part, dict) or "fileData" not in part:
+                    continue
+                file_data = part["fileData"]
+                if "fileUri" not in file_data:
+                    continue
+                file_uri = file_data["fileUri"]
+                # 從 URI 中提取文件名
+                # 1. https://generativelanguage.googleapis.com/v1beta/files/{file_id}
+                match = re.match(rf"{re.escape(settings.BASE_URL)}/(files/.*)", file_uri)
+                if not match:
+                    logger.warning(f"Invalid file URI: {file_uri}")
+                    continue
+                file_id = match.group(1)
+                file_names.append(file_id)
+                logger.info(f"Found file reference: {file_id}")
+    return file_names
+
+def _clean_json_schema_properties(obj: Any) -> Any:
+    """清理JSON Schema中Gemini API不支持的字段"""
+    if not isinstance(obj, dict):
+        return obj
+    
+    # Gemini API不支持的JSON Schema字段
+    unsupported_fields = {
+        "exclusiveMaximum", "exclusiveMinimum", "const", "examples", 
+        "contentEncoding", "contentMediaType", "if", "then", "else",
+        "allOf", "anyOf", "oneOf", "not", "definitions", "$schema",
+        "$id", "$ref", "$comment", "readOnly", "writeOnly"
+    }
+    
+    cleaned = {}
+    for key, value in obj.items():
+        if key in unsupported_fields:
+            continue
+        if isinstance(value, dict):
+            cleaned[key] = _clean_json_schema_properties(value)
+        elif isinstance(value, list):
+            cleaned[key] = [_clean_json_schema_properties(item) for item in value]
+        else:
+            cleaned[key] = value
+    
+    return cleaned
 
 
 def _build_tools(model: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -40,7 +89,15 @@ def _build_tools(model: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             for k, v in item.items():
                 if k == "functionDeclarations" and v and isinstance(v, list):
                     functions = record.get("functionDeclarations", [])
-                    functions.extend(v)
+                    # 清理每个函数声明中的不支持字段
+                    cleaned_functions = []
+                    for func in v:
+                        if isinstance(func, dict):
+                            cleaned_func = _clean_json_schema_properties(func)
+                            cleaned_functions.append(cleaned_func)
+                        else:
+                            cleaned_functions.append(func)
+                    functions.extend(cleaned_functions)
                     record["functionDeclarations"] = functions
                 else:
                     record[k] = v
@@ -78,21 +135,61 @@ def _get_safety_settings(model: str) -> List[Dict[str, str]]:
     return settings.SAFETY_SETTINGS
 
 
+def _filter_empty_parts(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filters out contents with empty or invalid parts."""
+    if not contents:
+        return []
+
+    filtered_contents = []
+    for content in contents:
+        if not content or "parts" not in content or not isinstance(content.get("parts"), list):
+            continue
+
+        valid_parts = [part for part in content["parts"] if isinstance(part, dict) and part]
+
+        if valid_parts:
+            new_content = content.copy()
+            new_content["parts"] = valid_parts
+            filtered_contents.append(new_content)
+
+    return filtered_contents
+
+
 def _build_payload(model: str, request: GeminiRequest) -> Dict[str, Any]:
     """构建请求payload"""
-    request_dict = request.model_dump()
+    request_dict = request.model_dump(exclude_none=False)
     if request.generationConfig:
         if request.generationConfig.maxOutputTokens is None:
             # 如果未指定最大输出长度，则不传递该字段，解决截断的问题
-            request_dict["generationConfig"].pop("maxOutputTokens")
-    
-    payload = {
-        "contents": request_dict.get("contents", []),
-        "tools": _build_tools(model, request_dict),
-        "safetySettings": _get_safety_settings(model),
-        "generationConfig": request_dict.get("generationConfig"),
-        "systemInstruction": request_dict.get("systemInstruction"),
-    }
+            if "maxOutputTokens" in request_dict["generationConfig"]:
+                request_dict["generationConfig"].pop("maxOutputTokens")
+
+    # 检查是否为TTS模型
+    is_tts_model = "tts" in model.lower()
+
+    if is_tts_model:
+        # TTS模型使用简化的payload，不包含tools和safetySettings
+        payload = {
+            "contents": _filter_empty_parts(request_dict.get("contents", [])),
+            "generationConfig": request_dict.get("generationConfig"),
+        }
+
+        # 只在有systemInstruction时才添加
+        if request_dict.get("systemInstruction"):
+            payload["systemInstruction"] = request_dict.get("systemInstruction")
+    else:
+        # 非TTS模型使用完整的payload
+        payload = {
+            "contents": _filter_empty_parts(request_dict.get("contents", [])),
+            "tools": _build_tools(model, request_dict),
+            "safetySettings": _get_safety_settings(model),
+            "generationConfig": request_dict.get("generationConfig"),
+            "systemInstruction": request_dict.get("systemInstruction"),
+        }
+
+    # 确保 generationConfig 不为 None
+    if payload["generationConfig"] is None:
+        payload["generationConfig"] = {}
 
     if model.endswith("-image") or model.endswith("-image-generation"):
         payload.pop("systemInstruction")
@@ -111,7 +208,13 @@ def _build_payload(model: str, request: GeminiRequest) -> Dict[str, Any]:
         if model.endswith("-non-thinking"):
             payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0} 
         elif model in settings.THINKING_BUDGET_MAP:
-            payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": settings.THINKING_BUDGET_MAP.get(model,1000)}
+            if settings.SHOW_THINKING_PROCESS:
+                payload["generationConfig"]["thinkingConfig"] = {
+                    "thinkingBudget": settings.THINKING_BUDGET_MAP.get(model,1000),
+                    "includeThoughts": True
+                }
+            else:
+                payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": settings.THINKING_BUDGET_MAP.get(model,1000)}
 
     return payload
 
@@ -152,6 +255,17 @@ class GeminiChatService:
         self, model: str, request: GeminiRequest, api_key: str
     ) -> Dict[str, Any]:
         """生成内容"""
+        # 檢查並獲取文件專用的 API key（如果有文件）
+        file_names = _extract_file_references(request.model_dump().get("contents", []))
+        if file_names:
+            logger.info(f"Request contains file references: {file_names}")
+            file_api_key = await get_file_api_key(file_names[0])
+            if file_api_key:
+                logger.info(f"Found API key for file {file_names[0]}: {file_api_key[:8]}...{file_api_key[-4:]}")
+                api_key = file_api_key  # 使用文件的 API key
+            else:
+                logger.warning(f"No API key found for file {file_names[0]}, using default key: {api_key[:8]}...{api_key[-4:]}")
+        
         payload = _build_payload(model, request)
         start_time = time.perf_counter()
         request_datetime = datetime.datetime.now()
@@ -195,10 +309,69 @@ class GeminiChatService:
                 request_time=request_datetime
             )
 
+    async def count_tokens(
+        self, model: str, request: GeminiRequest, api_key: str
+    ) -> Dict[str, Any]:
+        """计算token数量"""
+        # countTokens API只需要contents
+        payload = {"contents": _filter_empty_parts(request.model_dump().get("contents", []))}
+        start_time = time.perf_counter()
+        request_datetime = datetime.datetime.now()
+        is_success = False
+        status_code = None
+        response = None
+
+        try:
+            response = await self.api_client.count_tokens(payload, model, api_key)
+            is_success = True
+            status_code = 200
+            return response
+        except Exception as e:
+            is_success = False
+            error_log_msg = str(e)
+            logger.error(f"Count tokens API call failed with error: {error_log_msg}")
+            match = re.search(r"status code (\d+)", error_log_msg)
+            if match:
+                status_code = int(match.group(1))
+            else:
+                status_code = 500
+
+            await add_error_log(
+                gemini_key=api_key,
+                model_name=model,
+                error_type="gemini-count-tokens",
+                error_log=error_log_msg,
+                error_code=status_code,
+                request_msg=payload
+            )
+            raise e
+        finally:
+            end_time = time.perf_counter()
+            latency_ms = int((end_time - start_time) * 1000)
+            await add_request_log(
+                model_name=model,
+                api_key=api_key,
+                is_success=is_success,
+                status_code=status_code,
+                latency_ms=latency_ms,
+                request_time=request_datetime
+            )
+
     async def stream_generate_content(
         self, model: str, request: GeminiRequest, api_key: str
     ) -> AsyncGenerator[str, None]:
         """流式生成内容"""
+        # 檢查並獲取文件專用的 API key（如果有文件）
+        file_names = _extract_file_references(request.model_dump().get("contents", []))
+        if file_names:
+            logger.info(f"Request contains file references: {file_names}")
+            file_api_key = await get_file_api_key(file_names[0])
+            if file_api_key:
+                logger.info(f"Found API key for file {file_names[0]}: {file_api_key[:8]}...{file_api_key[-4:]}")
+                api_key = file_api_key  # 使用文件的 API key
+            else:
+                logger.warning(f"No API key found for file {file_names[0]}, using default key: {api_key[:8]}...{api_key[-4:]}")
+                
         retries = 0
         max_retries = settings.MAX_RETRIES
         payload = _build_payload(model, request)

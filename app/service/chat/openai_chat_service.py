@@ -26,14 +26,41 @@ from app.service.key.key_manager import KeyManager
 logger = get_openai_logger()
 
 
-def _has_media_parts(contents: List[Dict[str, Any]]) -> bool:
-    """判断消息是否包含图片、音频或视频部分 (inline_data)"""
-    for content in contents:
-        if content and "parts" in content and isinstance(content["parts"], list):
-            for part in content["parts"]:
-                if isinstance(part, dict) and "inline_data" in part:
+def _has_media_parts(messages: List[Dict[str, Any]]) -> bool:
+    """判断消息是否包含多媒体部分"""
+    for message in messages:
+        if "parts" in message:
+            for part in message["parts"]:
+                if "image_url" in part or "inline_data" in part:
                     return True
     return False
+
+
+def _clean_json_schema_properties(obj: Any) -> Any:
+    """清理JSON Schema中Gemini API不支持的字段"""
+    if not isinstance(obj, dict):
+        return obj
+    
+    # Gemini API不支持的JSON Schema字段
+    unsupported_fields = {
+        "exclusiveMaximum", "exclusiveMinimum", "const", "examples", 
+        "contentEncoding", "contentMediaType", "if", "then", "else",
+        "allOf", "anyOf", "oneOf", "not", "definitions", "$schema",
+        "$id", "$ref", "$comment", "readOnly", "writeOnly"
+    }
+    
+    cleaned = {}
+    for key, value in obj.items():
+        if key in unsupported_fields:
+            continue
+        if isinstance(value, dict):
+            cleaned[key] = _clean_json_schema_properties(value)
+        elif isinstance(value, list):
+            cleaned[key] = [_clean_json_schema_properties(item) for item in value]
+        else:
+            cleaned[key] = value
+    
+    return cleaned
 
 
 def _build_tools(
@@ -76,6 +103,8 @@ def _build_tools(
                 ):
                     function.pop("parameters", None)
 
+                # 清理函数中的不支持字段
+                function = _clean_json_schema_properties(function)
                 function_declarations.append(function)
 
         if function_declarations:
@@ -113,6 +142,23 @@ def _get_safety_settings(model: str) -> List[Dict[str, str]]:
     return settings.SAFETY_SETTINGS
 
 
+def _validate_and_set_max_tokens(
+    payload: Dict[str, Any], 
+    max_tokens: Optional[int], 
+    logger_instance
+) -> None:
+    """验证并设置 max_tokens 参数"""
+    if max_tokens is None:
+        return
+    
+    # 参数验证和处理
+    if max_tokens <= 0:
+        logger_instance.warning(f"Invalid max_tokens value: {max_tokens}, will not set maxOutputTokens")
+        # 不设置 maxOutputTokens，让 Gemini API 使用默认值
+    else:
+        payload["generationConfig"]["maxOutputTokens"] = max_tokens
+
+
 def _build_payload(
     request: ChatRequest,
     messages: List[Dict[str, Any]],
@@ -130,16 +176,24 @@ def _build_payload(
         "tools": _build_tools(request, messages),
         "safetySettings": _get_safety_settings(request.model),
     }
-    if request.max_tokens is not None:
-        payload["generationConfig"]["maxOutputTokens"] = request.max_tokens
+    
+    # 处理 max_tokens 参数
+    _validate_and_set_max_tokens(payload, request.max_tokens, logger)
+    
     if request.model.endswith("-image") or request.model.endswith("-image-generation"):
         payload["generationConfig"]["responseModalities"] = ["Text", "Image"]
+    
     if request.model.endswith("-non-thinking"):
         payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+    
     if request.model in settings.THINKING_BUDGET_MAP:
-        payload["generationConfig"]["thinkingConfig"] = {
-            "thinkingBudget": settings.THINKING_BUDGET_MAP.get(request.model, 1000)
-        }
+        if settings.SHOW_THINKING_PROCESS:
+            payload["generationConfig"]["thinkingConfig"] = {
+                "thinkingBudget": settings.THINKING_BUDGET_MAP.get(request.model, 1000),
+                "includeThoughts": True
+            }
+        else:
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": settings.THINKING_BUDGET_MAP.get(request.model, 1000)}
 
     if (
         instruction
@@ -206,27 +260,53 @@ class OpenAIChatService:
         is_success = False
         status_code = None
         response = None
+        
         try:
             response = await self.api_client.generate_content(payload, model, api_key)
             usage_metadata = response.get("usageMetadata", {})
             is_success = True
             status_code = 200
-            return self.response_handler.handle_response(
-                response,
-                model,
-                stream=False,
-                finish_reason="stop",
-                usage_metadata=usage_metadata,
-            )
+            
+            # 尝试处理响应，捕获可能的响应处理异常
+            try:
+                result = self.response_handler.handle_response(
+                    response,
+                    model,
+                    stream=False,
+                    finish_reason="stop",
+                    usage_metadata=usage_metadata,
+                )
+                return result
+            except Exception as response_error:
+                logger.error(f"Response processing failed for model {model}: {str(response_error)}")
+                
+                # 记录详细的错误信息
+                if "parts" in str(response_error):
+                    logger.error("Response structure issue - missing or invalid parts")
+                    if response.get("candidates"):
+                        candidate = response["candidates"][0]
+                        content = candidate.get("content", {})
+                        logger.error(f"Content structure: {content}")
+                
+                # 重新抛出异常
+                raise response_error
+                
         except Exception as e:
             is_success = False
             error_log_msg = str(e)
-            logger.error(f"Normal API call failed with error: {error_log_msg}")
+            logger.error(f"API call failed for model {model}: {error_log_msg}")
+            
+            # 特别记录 max_tokens 相关的错误
+            gen_config = payload.get('generationConfig', {})
+            if "maxOutputTokens" in gen_config:
+                logger.error(f"Request had maxOutputTokens: {gen_config['maxOutputTokens']}")
+            
+            # 如果是响应处理错误，记录更多信息
+            if "parts" in error_log_msg:
+                logger.error("This is likely a response processing error")
+            
             match = re.search(r"status code (\d+)", error_log_msg)
-            if match:
-                status_code = int(match.group(1))
-            else:
-                status_code = 500
+            status_code = int(match.group(1)) if match else 500
 
             await add_error_log(
                 gemini_key=api_key,
@@ -240,6 +320,8 @@ class OpenAIChatService:
         finally:
             end_time = time.perf_counter()
             latency_ms = int((end_time - start_time) * 1000)
+            logger.info(f"Normal completion finished - Success: {is_success}, Latency: {latency_ms}ms")
+            
             await add_request_log(
                 model_name=model,
                 api_key=api_key,
