@@ -30,6 +30,8 @@ class GeminiApiClient(ApiClient):
         self.timeout = timeout
 
     def _get_real_model(self, model: str) -> str:
+        if model.endswith("-aistudio"):
+            model = model[:-9]
         if model.endswith("-search"):
             model = model[:-7]
         if model.endswith("-image"):
